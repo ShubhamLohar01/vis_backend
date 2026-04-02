@@ -273,14 +273,14 @@ def check_in_visitor(
     # Add background task (non-blocking)
     background_tasks.add_task(
         send_sms_background,
-        visitor_data.id,
-        visitor_data.person_to_meet,
-        visitor_data.visitor_name,
-        visitor_data.mobile_number,
-        visitor_data.email_address,
-        visitor_data.company,
-        visitor_data.reason_to_visit,
-        visitor_data.warehouse
+        new_visitor.id,
+        new_visitor.person_to_meet,
+        new_visitor.visitor_name,
+        new_visitor.mobile_number,
+        new_visitor.email_address,
+        new_visitor.company,
+        new_visitor.reason_to_visit,
+        new_visitor.warehouse
     )
 
     return VisitorCheckInResponse(
