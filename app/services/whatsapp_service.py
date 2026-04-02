@@ -60,6 +60,8 @@ class WhatsAppService:
     def _get_messages_url(self) -> str:
         return f"{self.api_url}/{self.phone_number_id}/messages"
 
+    DEFAULT_VISITOR_IMAGE = "https://visitor-selfie-image.s3.ap-south-1.amazonaws.com/default-visitor.jpg"
+
     def send_visitor_approval_request(
         self,
         to_phone: str,
@@ -71,13 +73,16 @@ class WhatsAppService:
         visitor_id: str,
         warehouse: Optional[str] = None,
         person_to_meet_name: Optional[str] = None,
+        visitor_image_url: Optional[str] = None,
     ) -> bool:
         """
         Send WhatsApp template message with Approve/Reject buttons to approver.
 
-        Uses the pre-approved 'visitor_approval' template with 3 parameters:
-        {{1}} = Visitor Name, {{2}} = Purpose, {{3}} = Time
-        Buttons: Approve, Reject (quick reply with visitor_id as payload)
+        Uses pre-approved 'visitor_approval_emp' template:
+          header  = visitor selfie image
+          {{1}} = Visitor Name, {{2}} = Company, {{3}} = Purpose
+          {{4}} = Time,         {{5}} = Reference/ID
+          Buttons: Approve (approve_{visitor_id}), Reject (reject_{visitor_id})
         """
         if not self.enabled:
             logger.warning("WhatsApp service is disabled")
@@ -86,21 +91,30 @@ class WhatsAppService:
         try:
             formatted_to = self._format_phone_for_whatsapp(to_phone)
             current_time = datetime.now().strftime("%I:%M %p")
+            header_img = visitor_image_url or self.DEFAULT_VISITOR_IMAGE
 
             payload = {
                 "messaging_product": "whatsapp",
                 "to": formatted_to,
                 "type": "template",
                 "template": {
-                    "name": "visitor_approval",
+                    "name": "visitor_approval_emp",
                     "language": {"code": "en"},
                     "components": [
+                        {
+                            "type": "header",
+                            "parameters": [
+                                {"type": "image", "image": {"link": header_img}},
+                            ],
+                        },
                         {
                             "type": "body",
                             "parameters": [
                                 {"type": "text", "text": visitor_name},
+                                {"type": "text", "text": visitor_company or "Not specified"},
                                 {"type": "text", "text": reason_for_visit},
                                 {"type": "text", "text": current_time},
+                                {"type": "text", "text": visitor_id},
                             ],
                         },
                         {

@@ -426,6 +426,7 @@ async def check_in_visitor_with_image(
                     visitor_id=str(new_visitor.id),
                     warehouse=warehouse,
                     person_to_meet_name=approver.name if approver else person_to_meet,
+                    visitor_image_url=new_visitor.img_url,
                 )
                 if wa_sent:
                     logger.info(f"[WA] WhatsApp sent to {to_phone}")
