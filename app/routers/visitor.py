@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import re
 import logging
 
@@ -364,80 +366,96 @@ async def check_in_visitor_with_image(
     check_in_time = new_visitor.check_in_time
     visitor_number = check_in_time.strftime("%Y%m%d%H%M%S")
 
-    # Upload to S3 immediately (synchronous) - with increased timeouts this should complete within API Gateway limit
-    try:
-        logger.info(f"Starting S3 upload for visitor {visitor_number}")
-        img_url = s3_service.upload_visitor_image(
-            file_content=file_content,
-            visitor_number=visitor_number,
-            content_type=image.content_type
-        )
-        new_visitor.img_url = img_url
-        db.commit()
-        db.refresh(new_visitor)
-        logger.info(f"S3 upload complete for visitor {visitor_number}: {img_url}")
-    except Exception as e:
-        logger.error(f"S3 upload failed for visitor {visitor_number}: {str(e)}")
-        # Continue anyway - image can be uploaded later if needed
-        new_visitor.img_url = None
-        db.commit()
-        db.refresh(new_visitor)
+    # Resolve approver + superusers now (while DB session is open)
+    approver = _find_approver_for_notification(db, person_to_meet)
+    superuser_phones = _get_superuser_phone_numbers(db)
+    target_phones: List[str] = []
+    if approver and approver.ph_no:
+        target_phones.append(approver.ph_no)
+    for p in superuser_phones:
+        if p not in target_phones:
+            target_phones.append(p)
+    approver_name = approver.name if approver else person_to_meet
+    visitor_id_int = new_visitor.id
 
-    # Enrich with contact information
+    # Enrich for response (img_url will be None initially; updated in background)
     visitor_data = enrich_visitor_with_contact(new_visitor, db)
-    
-    # Extract date_of_visit and time_slot from health_declaration if present
-    date_of_visit = None
-    time_slot = None
-    if health_declaration:
+
+    def _background_s3_and_whatsapp(
+        _file_content: bytes,
+        _content_type: str,
+        _visitor_id: int,
+        _visitor_number: str,
+        _target_phones: List[str],
+        _approver_name: str,
+    ):
+        """
+        Step 1 – upload image to S3 (so we get the URL).
+        Step 2 – in parallel: update DB img_url  +  send WhatsApp with the image.
+        """
+        img_url = None
         try:
-            import json
-            health_data = json.loads(health_declaration)
-            date_of_visit = health_data.get('date_of_visit')
-            time_slot = health_data.get('time_slot')
-        except:
-            pass
+            logger.info(f"[BG] Starting S3 upload for visitor {_visitor_number}")
+            img_url = s3_service.upload_visitor_image(_file_content, _visitor_number, _content_type)
+            logger.info(f"[BG] S3 upload done: {img_url}")
+        except Exception as e:
+            logger.error(f"[BG] S3 upload failed: {e}")
 
-    # Send SMS notification - quick lookup and send (with timeout protection)
-    # Note: In Lambda, BackgroundTasks don't work as expected. We'll do a quick synchronous send with timeout.
-    try:
-        logger.info(f"[SMS] Searching for approver: {person_to_meet}")
-        approver = _find_approver_for_notification(db, person_to_meet)
-        
-        # Always notify superusers as well (they should see all SMS)
-        superuser_phones = _get_superuser_phone_numbers(db)
-        target_phones: List[str] = []
-        if approver and approver.ph_no:
-            target_phones.append(approver.ph_no)
-        for p in superuser_phones:
-            if p not in target_phones:
-                target_phones.append(p)
+        def _update_db():
+            if not img_url:
+                return
+            from app.core.database import SessionLocal
+            db_bg = SessionLocal()
+            try:
+                v = db_bg.query(Visitor).filter(Visitor.id == _visitor_id).first()
+                if v:
+                    v.img_url = img_url
+                    db_bg.commit()
+                    logger.info(f"[BG] img_url saved to DB for visitor {_visitor_id}")
+            except Exception as e:
+                logger.error(f"[BG] DB update failed: {e}")
+            finally:
+                db_bg.close()
 
-        if target_phones:
-            for to_phone in target_phones:
-                logger.info(f"[WA] Sending WhatsApp to {to_phone}")
-                wa_sent = whatsapp_service.send_visitor_approval_request(
-                    to_phone=to_phone,
-                    visitor_name=visitor_name,
-                    visitor_mobile=mobile_number,
-                    visitor_email=email_address,
-                    visitor_company=company,
-                    reason_for_visit=reason_to_visit,
-                    visitor_id=str(new_visitor.id),
-                    warehouse=warehouse,
-                    person_to_meet_name=approver.name if approver else person_to_meet,
-                    visitor_image_url=new_visitor.img_url,
-                )
-                if wa_sent:
-                    logger.info(f"[WA] WhatsApp sent to {to_phone}")
-                else:
-                    logger.warning(f"[WA] WhatsApp failed to {to_phone}")
-        else:
-            logger.warning(f"[WA] Approver '{person_to_meet}' not found or has no phone number")
-    except Exception as e:
-        # Don't fail the request if SMS fails
-        logger.error(f"[SMS] ✗ SMS error: {e}")
-        pass
+        def _send_whatsapp():
+            if not _target_phones:
+                logger.warning(f"[BG] No target phones for visitor {_visitor_id}")
+                return
+            for phone in _target_phones:
+                try:
+                    sent = whatsapp_service.send_visitor_approval_request(
+                        to_phone=phone,
+                        visitor_name=visitor_name,
+                        visitor_mobile=mobile_number,
+                        visitor_email=email_address,
+                        visitor_company=company,
+                        reason_for_visit=reason_to_visit,
+                        visitor_id=str(_visitor_id),
+                        warehouse=warehouse,
+                        person_to_meet_name=_approver_name,
+                        visitor_image_url=img_url,
+                    )
+                    logger.info(f"[BG] WhatsApp {'sent' if sent else 'failed'} to {phone}")
+                except Exception as e:
+                    logger.error(f"[BG] WhatsApp error to {phone}: {e}")
+
+        # Run DB update and WhatsApp in parallel after S3 completes
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_update_db), pool.submit(_send_whatsapp)]
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.error(f"[BG] Parallel task error: {e}")
+
+    # Launch background thread — API response returns immediately
+    t = threading.Thread(
+        target=_background_s3_and_whatsapp,
+        args=(file_content, image.content_type, visitor_id_int,
+              visitor_number, target_phones, approver_name),
+        daemon=True,
+    )
+    t.start()
 
     return VisitorCheckInResponse(
         message="Visitor checked in successfully with image",

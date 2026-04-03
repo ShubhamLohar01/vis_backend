@@ -18,21 +18,17 @@ class S3Service:
 
     def __init__(self):
         """Initialize S3 client with AWS credentials from settings."""
-        # Use regional endpoint to ensure signature matches the URL host
-        regional_endpoint = f"https://s3.{settings.aws_region}.amazonaws.com"
-        
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key,
             region_name=settings.aws_region,
-            endpoint_url=regional_endpoint,
             config=BotoConfig(
                 signature_version='s3v4',
                 s3={'addressing_style': 'virtual'},
-                connect_timeout=10,  # Increased from 5 to 10 seconds
-                read_timeout=60,     # Increased from 10 to 60 seconds
-                retries={'max_attempts': 3}  # Increased retries from 2 to 3
+                connect_timeout=10,
+                read_timeout=60,
+                retries={'max_attempts': 3}
             )
         )
         self.bucket_name = settings.aws_s3_bucket_name
