@@ -170,14 +170,18 @@ async def _handle_button_reply(db: Session, sender_phone: str, button_id: str):
         whatsapp_service.send_text_message(sender_phone, "Invalid visitor ID.")
         return
 
-    visitor = db.query(Visitor).filter(
-        Visitor.id == visitor_id_int,
-        (Visitor.person_to_meet == approver.username) | (Visitor.person_to_meet == approver.name),
-    ).first()
+    visitor = db.query(Visitor).filter(Visitor.id == visitor_id_int).first()
 
     if not visitor:
-        logger.warning(f"[WA-WEBHOOK] Visitor {visitor_id_int} not found for approver {approver.username}")
-        whatsapp_service.send_text_message(sender_phone, f"Visitor {visitor_id_str} not found or not assigned to you.")
+        logger.warning(f"[WA-WEBHOOK] Visitor {visitor_id_int} not found")
+        whatsapp_service.send_text_message(sender_phone, f"Visitor {visitor_id_str} not found.")
+        return
+
+    # Check approver is assigned or is a superuser
+    is_assigned = visitor.person_to_meet in (approver.username, approver.name)
+    if not is_assigned and not approver.superuser:
+        logger.warning(f"[WA-WEBHOOK] Approver {approver.username} not authorized for visitor {visitor_id_int}")
+        whatsapp_service.send_text_message(sender_phone, f"Visitor {visitor_id_str} is not assigned to you.")
         return
 
     if visitor.status != VisitorStatus.WAITING:
@@ -267,22 +271,13 @@ async def _handle_text_approval(db: Session, sender_phone: str, action: str):
 
 
 def _send_visitor_approval_whatsapp(visitor: Visitor, approver: Approver):
-    """Send approval WhatsApp message to the visitor."""
+    """Send visitor_approved template to the visitor."""
     try:
-        visitor_number = str(visitor.id)
-        message = (
-            f"Your visit request has been approved!\n\n"
-            f"Dear {visitor.visitor_name},\n"
-            f"Your visit request has been approved. Please come and visit us.\n"
-            f"Meeting with: {approver.name}\n"
-            f"Visitor ID: {visitor_number}\n\n"
-            f"We look forward to seeing you!\n"
-            f"Thank you, Candor Foods"
-        )
-        whatsapp_service.send_text_message(
+        visitor_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S")
+        whatsapp_service.send_approval_notification(
             to_phone=visitor.mobile_number,
-            text=message,
+            visitor_id_str=visitor_number,
         )
-        logger.info(f"[WA-WEBHOOK] Approval WhatsApp sent to visitor {visitor.visitor_name}")
+        logger.info(f"[WA-WEBHOOK] visitor_approved template sent to {visitor.visitor_name}")
     except Exception as e:
         logger.error(f"[WA-WEBHOOK] Failed to send approval WhatsApp to visitor: {e}")
