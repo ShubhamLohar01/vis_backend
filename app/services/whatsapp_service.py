@@ -62,6 +62,33 @@ class WhatsAppService:
 
     DEFAULT_VISITOR_IMAGE = "https://visitor-selfie-image.s3.ap-south-1.amazonaws.com/default-visitor.jpg"
 
+    def upload_media(self, image_bytes: bytes, content_type: str = "image/jpeg") -> Optional[str]:
+        """
+        Upload image bytes directly to WhatsApp Media API.
+        Returns media_id string, or None on failure.
+        """
+        if not self.enabled:
+            return None
+        try:
+            media_url = f"{self.api_url}/{self.phone_number_id}/media"
+            with httpx.Client(timeout=30) as client:
+                response = client.post(
+                    media_url,
+                    headers={"Authorization": f"Bearer {self.access_token}"},
+                    files={"file": ("selfie.jpg", image_bytes, content_type)},
+                    data={"messaging_product": "whatsapp", "type": content_type},
+                )
+            if response.status_code == 200:
+                media_id = response.json().get("id")
+                logger.info(f"WhatsApp media uploaded. media_id: {media_id}")
+                return media_id
+            else:
+                logger.error(f"WhatsApp media upload failed: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"WhatsApp media upload error: {e}")
+            return None
+
     def send_visitor_approval_request(
         self,
         to_phone: str,
@@ -73,16 +100,17 @@ class WhatsAppService:
         visitor_id: str,
         warehouse: Optional[str] = None,
         person_to_meet_name: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
+        image_content_type: str = "image/jpeg",
         visitor_image_url: Optional[str] = None,
     ) -> bool:
         """
-        Send WhatsApp template message with Approve/Reject buttons to approver.
+        Send visitor_approval_emp template with Approve/Reject buttons.
 
-        Uses pre-approved 'visitor_approval_emp' template:
-          header  = visitor selfie image
-          {{1}} = Visitor Name, {{2}} = Company, {{3}} = Purpose
-          {{4}} = Time,         {{5}} = Reference/ID
-          Buttons: Approve (approve_{visitor_id}), Reject (reject_{visitor_id})
+        Image priority:
+          1. image_bytes → uploaded to WhatsApp Media API → media_id used in header
+          2. visitor_image_url → used as link in header
+          3. DEFAULT_VISITOR_IMAGE fallback
         """
         if not self.enabled:
             logger.warning("WhatsApp service is disabled")
@@ -91,7 +119,20 @@ class WhatsAppService:
         try:
             formatted_to = self._format_phone_for_whatsapp(to_phone)
             current_time = datetime.now().strftime("%I:%M %p")
-            header_img = visitor_image_url or self.DEFAULT_VISITOR_IMAGE
+
+            # Build header image component
+            if image_bytes:
+                media_id = self.upload_media(image_bytes, image_content_type)
+                if media_id:
+                    header_param = {"type": "image", "image": {"id": media_id}}
+                else:
+                    # fallback to URL if media upload fails
+                    fallback = visitor_image_url or self.DEFAULT_VISITOR_IMAGE
+                    header_param = {"type": "image", "image": {"link": fallback}}
+            elif visitor_image_url:
+                header_param = {"type": "image", "image": {"link": visitor_image_url}}
+            else:
+                header_param = {"type": "image", "image": {"link": self.DEFAULT_VISITOR_IMAGE}}
 
             payload = {
                 "messaging_product": "whatsapp",
@@ -103,9 +144,7 @@ class WhatsAppService:
                     "components": [
                         {
                             "type": "header",
-                            "parameters": [
-                                {"type": "image", "image": {"link": header_img}},
-                            ],
+                            "parameters": [header_param],
                         },
                         {
                             "type": "body",
@@ -118,26 +157,18 @@ class WhatsAppService:
                             ],
                         },
                         {
-                            "type": "button",
-                            "sub_type": "quick_reply",
-                            "index": "0",
-                            "parameters": [
-                                {"type": "payload", "payload": f"approve_{visitor_id}"},
-                            ],
+                            "type": "button", "sub_type": "quick_reply", "index": "0",
+                            "parameters": [{"type": "payload", "payload": f"approve_{visitor_id}"}],
                         },
                         {
-                            "type": "button",
-                            "sub_type": "quick_reply",
-                            "index": "1",
-                            "parameters": [
-                                {"type": "payload", "payload": f"reject_{visitor_id}"},
-                            ],
+                            "type": "button", "sub_type": "quick_reply", "index": "1",
+                            "parameters": [{"type": "payload", "payload": f"reject_{visitor_id}"}],
                         },
                     ],
                 },
             }
 
-            logger.info(f"Sending WhatsApp template to {formatted_to} for visitor {visitor_id}")
+            logger.info(f"Sending visitor_approval_emp to {formatted_to} for visitor {visitor_id}")
 
             with httpx.Client(timeout=10) as client:
                 response = client.post(
@@ -147,9 +178,8 @@ class WhatsAppService:
                 )
 
             if response.status_code == 200:
-                data = response.json()
-                message_id = data.get("messages", [{}])[0].get("id", "unknown")
-                logger.info(f"WhatsApp template sent successfully. Message ID: {message_id}")
+                msg_id = response.json().get("messages", [{}])[0].get("id", "unknown")
+                logger.info(f"WhatsApp template sent. Message ID: {msg_id}")
                 return True
             else:
                 logger.error(f"WhatsApp API error: {response.status_code} - {response.text}")

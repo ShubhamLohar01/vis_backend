@@ -390,33 +390,11 @@ async def check_in_visitor_with_image(
         _approver_name: str,
     ):
         """
-        Step 1 – upload image to S3 (so we get the URL).
-        Step 2 – in parallel: update DB img_url  +  send WhatsApp with the image.
+        Run S3 upload and WhatsApp notification fully in parallel.
+        - WhatsApp: uploads image bytes directly to WhatsApp Media API → sends template
+        - S3: uploads image bytes → updates DB with img_url
+        Both start at the same time using image bytes already in memory.
         """
-        img_url = None
-        try:
-            logger.info(f"[BG] Starting S3 upload for visitor {_visitor_number}")
-            img_url = s3_service.upload_visitor_image(_file_content, _visitor_number, _content_type)
-            logger.info(f"[BG] S3 upload done: {img_url}")
-        except Exception as e:
-            logger.error(f"[BG] S3 upload failed: {e}")
-
-        def _update_db():
-            if not img_url:
-                return
-            from app.core.database import SessionLocal
-            db_bg = SessionLocal()
-            try:
-                v = db_bg.query(Visitor).filter(Visitor.id == _visitor_id).first()
-                if v:
-                    v.img_url = img_url
-                    db_bg.commit()
-                    logger.info(f"[BG] img_url saved to DB for visitor {_visitor_id}")
-            except Exception as e:
-                logger.error(f"[BG] DB update failed: {e}")
-            finally:
-                db_bg.close()
-
         def _send_whatsapp():
             if not _target_phones:
                 logger.warning(f"[BG] No target phones for visitor {_visitor_id}")
@@ -433,15 +411,38 @@ async def check_in_visitor_with_image(
                         visitor_id=str(_visitor_id),
                         warehouse=warehouse,
                         person_to_meet_name=_approver_name,
-                        visitor_image_url=img_url,
+                        image_bytes=_file_content,
+                        image_content_type=_content_type,
                     )
                     logger.info(f"[BG] WhatsApp {'sent' if sent else 'failed'} to {phone}")
                 except Exception as e:
                     logger.error(f"[BG] WhatsApp error to {phone}: {e}")
 
-        # Run DB update and WhatsApp in parallel after S3 completes
+        def _upload_s3_and_update_db():
+            try:
+                logger.info(f"[BG] Starting S3 upload for visitor {_visitor_number}")
+                img_url = s3_service.upload_visitor_image(_file_content, _visitor_number, _content_type)
+                logger.info(f"[BG] S3 upload done: {img_url}")
+            except Exception as e:
+                logger.error(f"[BG] S3 upload failed: {e}")
+                return
+            try:
+                from app.core.database import SessionLocal
+                db_bg = SessionLocal()
+                try:
+                    v = db_bg.query(Visitor).filter(Visitor.id == _visitor_id).first()
+                    if v:
+                        v.img_url = img_url
+                        db_bg.commit()
+                        logger.info(f"[BG] img_url saved to DB for visitor {_visitor_id}")
+                finally:
+                    db_bg.close()
+            except Exception as e:
+                logger.error(f"[BG] DB update failed: {e}")
+
+        # WhatsApp and S3 run fully in parallel — both use image bytes from memory
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(_update_db), pool.submit(_send_whatsapp)]
+            futures = [pool.submit(_send_whatsapp), pool.submit(_upload_s3_and_update_db)]
             for f in futures:
                 try:
                     f.result()
