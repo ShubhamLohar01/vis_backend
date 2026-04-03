@@ -869,31 +869,13 @@ def update_visitor_status(
                                         person_to_meet_name: Optional[str],
                                         visitor_id_str: str, is_appt: bool,
                                         visit_date: Optional[str], visit_time: Optional[str]):
-            """Background task to send approval WhatsApp to visitor"""
+            """Background task to send approval WhatsApp to visitor using visitor_approved template."""
             try:
                 logger.info(f"[WA] Sending approval WhatsApp to visitor {visitor_name} at {visitor_mobile}")
 
-                message_parts = [
-                    f"Your visit request has been approved!",
-                    f"",
-                    f"Dear {visitor_name},",
-                ]
-                if is_appt:
-                    message_parts.append("Your appointment has been approved.")
-                    if visit_date:
-                        message_parts.append(f"Date: {visit_date}")
-                    if visit_time:
-                        message_parts.append(f"Time: {visit_time}")
-                else:
-                    message_parts.append("Your visit request has been approved. Please come and visit us.")
-                if person_to_meet_name:
-                    message_parts.append(f"Meeting with: {person_to_meet_name}")
-                message_parts.append(f"Visitor ID: {visitor_id_str}")
-                message_parts.extend(["", "We look forward to seeing you!", "Thank you, Candor Foods"])
-
-                wa_sent = whatsapp_service.send_text_message(
+                wa_sent = whatsapp_service.send_approval_notification(
                     to_phone=visitor_mobile,
-                    text="\n".join(message_parts),
+                    visitor_id_str=visitor_id_str,
                 )
 
                 if wa_sent:
@@ -929,6 +911,17 @@ def update_visitor_status(
             date_of_visit,
             time_slot
         )
+
+    # Send visitor_rejected template when rejected
+    if status_data.status == VisitorStatus.REJECTED:
+        visitor_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S")
+        try:
+            whatsapp_service.send_rejection_notification(
+                to_phone=visitor.mobile_number,
+                visitor_id_str=visitor_number,
+            )
+        except Exception as e:
+            logger.error(f"[WA] Error sending rejection WhatsApp: {e}")
 
     db.commit()
     db.refresh(visitor)

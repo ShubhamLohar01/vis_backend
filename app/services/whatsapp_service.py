@@ -162,6 +162,72 @@ class WhatsAppService:
             logger.error(f"Unexpected error sending WhatsApp message: {e}")
             return False
 
+    def send_approval_notification(self, to_phone: str, visitor_id_str: str) -> bool:
+        """Send visitor_approved template to visitor when their request is approved."""
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "visitor_approved",
+                    "language": {"code": "en"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [{"type": "text", "text": visitor_id_str}],
+                        }
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"visitor_approved template sent to {formatted_to}")
+                return True
+            else:
+                logger.error(f"visitor_approved error: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error sending approval notification: {e}")
+            return False
+
+    def send_rejection_notification(self, to_phone: str, visitor_id_str: str) -> bool:
+        """Send visitor_rejected template to visitor when their request is rejected."""
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "visitor_rejected",
+                    "language": {"code": "en"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [{"type": "text", "text": visitor_id_str}],
+                        }
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"visitor_rejected template sent to {formatted_to}")
+                return True
+            else:
+                logger.error(f"visitor_rejected error: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error sending rejection notification: {e}")
+            return False
+
     def send_text_message(self, to_phone: str, text: str) -> bool:
         """Send a plain text WhatsApp message (for confirmations)."""
         if not self.enabled:
