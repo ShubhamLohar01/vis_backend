@@ -66,6 +66,31 @@ async def test_whatsapp_templates(phone_number: str):
     }
 
 
+@router.post("/debug/{phone_number}", status_code=status.HTTP_200_OK)
+async def debug_whatsapp(phone_number: str):
+    """Send a text message and return the raw Meta API response for debugging."""
+    import httpx
+    formatted = whatsapp_service._format_phone_for_whatsapp(phone_number)
+    url = whatsapp_service._get_messages_url()
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": formatted,
+        "type": "text",
+        "text": {"body": "Debug test from Visitor Management System."},
+    }
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.post(url, headers=whatsapp_service._get_headers(), json=payload)
+        return {
+            "formatted_phone": formatted,
+            "api_url": url,
+            "status_code": response.status_code,
+            "response": response.json(),
+        }
+    except Exception as e:
+        return {"error": str(e), "formatted_phone": formatted}
+
+
 def _normalize_phone(phone: str) -> str:
     """Return last 10 digits for approver matching."""
     digits = ''.join(filter(str.isdigit, phone))
