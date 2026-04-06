@@ -17,6 +17,7 @@ from app.schemas.approver import (
     Token,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
+    IdentifyRequest,
 )
 
 
@@ -119,6 +120,50 @@ def login(
         access_token=access_token,
         token_type="bearer",
         approver=approver_response
+    )
+
+
+@router.post("/identify", response_model=ApproverLoginResponse, status_code=status.HTTP_200_OK)
+def identify(
+    request: IdentifyRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Identify an approver by full name without a password.
+    Public endpoint - used for the approver dashboard login by name.
+
+    Args:
+        request: Identify request containing the approver's full name
+        db: Database session
+
+    Returns:
+        JWT access token and approver information
+
+    Raises:
+        HTTPException: If approver not found or account is inactive
+    """
+    approver = db.query(Approver).filter(Approver.name == request.name).first()
+
+    if not approver:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No employee found with name '{request.name}'. Please enter your full name as registered."
+        )
+
+    if not approver.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is inactive. Please contact administrator."
+        )
+
+    access_token = AuthUtils.create_access_token(
+        data={"sub": approver.username, "approver_id": approver.id}
+    )
+
+    return ApproverLoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        approver=ApproverResponse.model_validate(approver)
     )
 
 

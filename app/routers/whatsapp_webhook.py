@@ -19,6 +19,53 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp Webhook"])
 
 
+@router.get("/status", status_code=status.HTTP_200_OK)
+async def whatsapp_status():
+    """Check if WhatsApp service is enabled and configured on this server."""
+    return {
+        "enabled": whatsapp_service.enabled,
+        "phone_number_id": whatsapp_service.phone_number_id or "NOT SET",
+        "access_token_set": bool(whatsapp_service.access_token),
+        "api_url": whatsapp_service.api_url,
+    }
+
+
+@router.post("/test/{phone_number}", status_code=status.HTTP_200_OK)
+async def test_whatsapp_templates(phone_number: str):
+    """Send all WhatsApp templates to a phone number for testing."""
+    results = {}
+
+    results["text_message"] = whatsapp_service.send_text_message(
+        to_phone=phone_number,
+        text="Test message from Visitor Management System backend.",
+    )
+    results["visitor_approval_emp"] = whatsapp_service.send_visitor_approval_request(
+        to_phone=phone_number,
+        visitor_name="Test Visitor",
+        visitor_mobile=phone_number,
+        visitor_email="test@example.com",
+        visitor_company="Test Company",
+        reason_for_visit="Backend WhatsApp Test",
+        visitor_id="20260406120000",
+        warehouse="Main",
+        person_to_meet_name="Test Approver",
+    )
+    results["visitor_approved"] = whatsapp_service.send_approval_notification(
+        to_phone=phone_number,
+        visitor_id_str="20260406120000",
+    )
+    results["visitor_rejected"] = whatsapp_service.send_rejection_notification(
+        to_phone=phone_number,
+        visitor_id_str="20260406120000",
+    )
+
+    return {
+        "phone": phone_number,
+        "whatsapp_enabled": whatsapp_service.enabled,
+        "results": results,
+    }
+
+
 def _normalize_phone(phone: str) -> str:
     """Return last 10 digits for approver matching."""
     digits = ''.join(filter(str.isdigit, phone))

@@ -94,3 +94,8 @@ class ForgotPasswordResponse(BaseModel):
     """Schema for forgot password response"""
     message: str
     username: str
+
+
+class IdentifyRequest(BaseModel):
+    """Schema for identify-by-name request"""
+    name: str = Field(..., min_length=1, description="Full name of the approver")
