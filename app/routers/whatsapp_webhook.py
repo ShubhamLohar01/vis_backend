@@ -49,6 +49,66 @@ def _find_approver(db: Session, phone: str) -> Optional[Approver]:
     return None
 
 
+@router.get("/status", status_code=status.HTTP_200_OK)
+async def whatsapp_status():
+    """Return current WhatsApp service configuration status."""
+    return {
+        "enabled": whatsapp_service.enabled,
+        "phone_number_id": settings.whatsapp_phone_number_id,
+        "access_token_set": bool(settings.whatsapp_access_token),
+        "api_url": settings.whatsapp_api_url,
+    }
+
+
+@router.post("/test/{phone_number}", status_code=status.HTTP_200_OK)
+def test_whatsapp_templates(phone_number: str):
+    """
+    Send all WhatsApp templates to a phone number for testing.
+    Returns per-template success/failure results.
+    """
+    from datetime import datetime
+
+    now = datetime.now()
+    visit_time = now.strftime("%I:%M %p")
+    reference_no = now.strftime("%Y%m%d%H%M%S")
+
+    results = {}
+
+    # 1. Text message
+    results["text_message"] = whatsapp_service.send_text_message(
+        phone_number, f"WhatsApp test at {visit_time} - service is working!"
+    )
+
+    # 2. visitor_approval_emp template
+    results["visitor_approval_emp"] = whatsapp_service.send_visitor_approval_request(
+        to_phone=phone_number,
+        visitor_name="Test Visitor",
+        visitor_mobile="9999999999",
+        visitor_email="test@example.com",
+        visitor_company="Test Company",
+        reason_for_visit="Template Test",
+        visitor_id=reference_no,
+    )
+
+    # 3. visitor_approved template
+    results["visitor_approved"] = whatsapp_service.send_approval_notification(
+        to_phone=phone_number,
+        visitor_id_str=f"CN-{reference_no}",
+    )
+
+    # 4. visitor_rejected template
+    results["visitor_rejected"] = whatsapp_service.send_rejection_notification(
+        to_phone=phone_number,
+        visitor_id_str=f"CN-{reference_no}",
+    )
+
+    return {
+        "phone": phone_number,
+        "whatsapp_enabled": whatsapp_service.enabled,
+        "results": results,
+    }
+
+
 @router.get("/webhook", status_code=status.HTTP_200_OK)
 async def verify_webhook(
     request: Request,
@@ -216,9 +276,19 @@ async def _handle_button_reply(db: Session, sender_phone: str, button_id: str):
             f"Visitor {visitor_id_str} ({visitor.visitor_name}) has been {status_text}."
         )
 
-        # If approved, send SMS notification to visitor
-        if action == "approve":
-            _send_visitor_approval_whatsapp(visitor, approver)
+        # Notify visitor of approval/rejection
+        if visitor.mobile_number:
+            cn_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S") if visitor.check_in_time else str(visitor.id)
+            if action == "approve":
+                whatsapp_service.send_approval_notification(
+                    to_phone=visitor.mobile_number,
+                    visitor_id_str=cn_number,
+                )
+            else:
+                whatsapp_service.send_rejection_notification(
+                    to_phone=visitor.mobile_number,
+                    visitor_id_str=cn_number,
+                )
 
     except Exception as e:
         db.rollback()
@@ -261,8 +331,18 @@ async def _handle_text_approval(db: Session, sender_phone: str, action: str):
             f"Visitor {visitor.id} ({visitor.visitor_name}) has been {status_text}."
         )
 
-        if action == "approve":
-            _send_visitor_approval_whatsapp(visitor, approver)
+        if visitor.mobile_number:
+            cn_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S") if visitor.check_in_time else str(visitor.id)
+            if action == "approve":
+                whatsapp_service.send_approval_notification(
+                    to_phone=visitor.mobile_number,
+                    visitor_id_str=cn_number,
+                )
+            else:
+                whatsapp_service.send_rejection_notification(
+                    to_phone=visitor.mobile_number,
+                    visitor_id_str=cn_number,
+                )
 
     except Exception as e:
         db.rollback()
@@ -270,14 +350,3 @@ async def _handle_text_approval(db: Session, sender_phone: str, action: str):
         whatsapp_service.send_text_message(sender_phone, "Error updating visitor. Please use the dashboard.")
 
 
-def _send_visitor_approval_whatsapp(visitor: Visitor, approver: Approver):
-    """Send visitor_approved template to the visitor."""
-    try:
-        visitor_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S")
-        whatsapp_service.send_approval_notification(
-            to_phone=visitor.mobile_number,
-            visitor_id_str=visitor_number,
-        )
-        logger.info(f"[WA-WEBHOOK] visitor_approved template sent to {visitor.visitor_name}")
-    except Exception as e:
-        logger.error(f"[WA-WEBHOOK] Failed to send approval WhatsApp to visitor: {e}")

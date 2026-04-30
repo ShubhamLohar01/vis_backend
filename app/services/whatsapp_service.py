@@ -258,6 +258,45 @@ class WhatsAppService:
             logger.error(f"Error sending rejection notification: {e}")
             return False
 
+    def send_otp_notification(self, to_phone: str, otp_code: str) -> bool:
+        """Send visitor_revisit_otp template with COPY_CODE button for revisit verification."""
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "visitor_revisit_otp",
+                    "language": {"code": "en_US"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [{"type": "text", "text": otp_code}],
+                        },
+                        {
+                            "type": "button",
+                            "sub_type": "url",
+                            "index": "0",
+                            "parameters": [{"type": "text", "text": otp_code}],
+                        },
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"visitor_revisit_otp sent to {formatted_to}")
+                return True
+            else:
+                logger.error(f"visitor_revisit_otp error: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error sending OTP notification: {e}")
+            return False
+
     def send_text_message(self, to_phone: str, text: str) -> bool:
         """Send a plain text WhatsApp message (for confirmations)."""
         if not self.enabled:
