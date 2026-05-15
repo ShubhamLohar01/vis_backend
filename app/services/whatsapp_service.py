@@ -3,10 +3,15 @@ WhatsApp Service for sending notifications via Meta WhatsApp Business Cloud API.
 """
 from typing import Optional
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import logging
 import httpx
 
 from app.core.config import settings
+
+# All timestamps shown to Indian visitors/approvers should be in IST regardless
+# of where the server runs (Lambda is UTC by default).
+IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +123,9 @@ class WhatsAppService:
 
         try:
             formatted_to = self._format_phone_for_whatsapp(to_phone)
-            current_time = datetime.now().strftime("%I:%M %p")
+            # Use IST so the time displayed matches the visitor's local time,
+            # not the Lambda runtime's UTC clock.
+            current_time = datetime.now(IST).strftime("%I:%M %p")
 
             # Build header image component
             if image_bytes:
@@ -295,6 +302,165 @@ class WhatsAppService:
                 return False
         except Exception as e:
             logger.error(f"Error sending OTP notification: {e}")
+            return False
+
+    def send_appointment_approval_request(
+        self,
+        to_phone: str,
+        visitor_name: str,
+        company: Optional[str],
+        purpose: str,
+        date_of_visit: Optional[str],
+        time_slot: Optional[str],
+        visitor_id: str,
+    ) -> bool:
+        """
+        Send appointment_approval_emp template to an approver with Approve/Reject buttons.
+        Body params: {{1}} visitor_name, {{2}} company, {{3}} purpose, {{4}} date, {{5}} time, {{6}} visitor_id
+        Quick-reply payloads use the same approve_<id>/reject_<id> format as walk-ins,
+        so the existing webhook handler works unchanged.
+        """
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "appointment_approval_emp",
+                    "language": {"code": "en"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": visitor_name},
+                                {"type": "text", "text": company or "Not specified"},
+                                {"type": "text", "text": purpose},
+                                {"type": "text", "text": date_of_visit or "Not specified"},
+                                {"type": "text", "text": time_slot or "Not specified"},
+                                {"type": "text", "text": visitor_id},
+                            ],
+                        },
+                        {
+                            "type": "button", "sub_type": "quick_reply", "index": "0",
+                            "parameters": [{"type": "payload", "payload": f"approve_{visitor_id}"}],
+                        },
+                        {
+                            "type": "button", "sub_type": "quick_reply", "index": "1",
+                            "parameters": [{"type": "payload", "payload": f"reject_{visitor_id}"}],
+                        },
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"appointment_approval_emp sent to {formatted_to} for visitor {visitor_id}")
+                return True
+            logger.error(f"appointment_approval_emp error: {response.status_code} - {response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending appointment_approval_emp: {e}")
+            return False
+
+    def send_appointment_approved_notification(
+        self,
+        to_phone: str,
+        visitor_name: str,
+        date_of_visit: Optional[str],
+        time_slot: Optional[str],
+        qr_code: str,
+        visitor_id_str: str,
+    ) -> bool:
+        """
+        Send appointment_approved template to visitor confirming their appointment.
+        Body params: {{1}} visitor_name, {{2}} date, {{3}} time, {{4}} qr_code, {{5}} visitor_id_str
+        """
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "appointment_approved",
+                    "language": {"code": "en"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": visitor_name},
+                                {"type": "text", "text": date_of_visit or "TBD"},
+                                {"type": "text", "text": time_slot or "TBD"},
+                                {"type": "text", "text": qr_code},
+                                {"type": "text", "text": visitor_id_str},
+                            ],
+                        }
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"appointment_approved sent to {formatted_to}")
+                return True
+            logger.error(f"appointment_approved error: {response.status_code} - {response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending appointment_approved: {e}")
+            return False
+
+    def send_appointment_rejected_notification(
+        self,
+        to_phone: str,
+        visitor_name: str,
+        date_of_visit: Optional[str],
+        time_slot: Optional[str],
+        rejection_reason: Optional[str],
+        visitor_id_str: str,
+    ) -> bool:
+        """
+        Send appointment_rejected template to visitor.
+        Body params: {{1}} visitor_name, {{2}} date, {{3}} time, {{4}} rejection_reason, {{5}} visitor_id_str
+        """
+        if not self.enabled:
+            return False
+        try:
+            formatted_to = self._format_phone_for_whatsapp(to_phone)
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": formatted_to,
+                "type": "template",
+                "template": {
+                    "name": "appointment_rejected",
+                    "language": {"code": "en"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": visitor_name},
+                                {"type": "text", "text": date_of_visit or "Not specified"},
+                                {"type": "text", "text": time_slot or "Not specified"},
+                                {"type": "text", "text": rejection_reason or "No reason provided"},
+                                {"type": "text", "text": visitor_id_str},
+                            ],
+                        }
+                    ],
+                },
+            }
+            with httpx.Client(timeout=10) as client:
+                response = client.post(self._get_messages_url(), headers=self._get_headers(), json=payload)
+            if response.status_code == 200:
+                logger.info(f"appointment_rejected sent to {formatted_to}")
+                return True
+            logger.error(f"appointment_rejected error: {response.status_code} - {response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending appointment_rejected: {e}")
             return False
 
     def send_text_message(self, to_phone: str, text: str) -> bool:

@@ -1,18 +1,22 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime
+from datetime import datetime, timezone, date
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import re
 import logging
+import io
 
 from app.core.database import get_db
 from app.core.auth import get_current_approver
 from app.models.approver import Approver
 from app.models.visitor import Visitor, VisitorStatus
 from app.models.appointment import Appointment
+from app.models.otp import OtpCode
 from app.schemas.visitor import (
     VisitorCheckIn,
     VisitorUpdate,
@@ -96,7 +100,12 @@ def enrich_visitor_with_contact(visitor: Visitor, db: Session) -> dict:
         "created_at": visitor.created_at,
         "updated_at": visitor.updated_at,
         "person_to_meet_contact": None,
-        "img_url": visitor.img_url,
+        # Always re-sign the URL before sending it out. The DB stores a presigned
+        # URL with ExpiresIn=7 days, so anything older has a dead URL and the
+        # frontend would show the grey silhouette. refresh_presigned_url uses the
+        # stored URL only as a source of the S3 object key, then mints a fresh
+        # 7-day URL using our IAM credentials. No-op for None / non-S3 URLs.
+        "img_url": s3_service.refresh_presigned_url(visitor.img_url),
         "date_of_visit": date_of_visit,
         "time_slot": time_slot
     }
@@ -297,55 +306,111 @@ async def check_in_visitor_with_image(
     mobile_number: str = Form(..., min_length=10, max_length=20, description="Mobile number of the visitor"),
     person_to_meet: str = Form(..., min_length=1, max_length=255, description="Person the visitor wants to meet"),
     reason_to_visit: str = Form(..., min_length=1, max_length=500, description="Reason for the visit"),
-    email_address: str = Form(..., description="Email address of the visitor"),
-    company: str = Form(..., min_length=1, max_length=255, description="Company name of the visitor"),
+    # On revisit the visitor doesn't re-enter email / company / selfie — we
+    # reuse what was stored on the previous visit. These are therefore optional.
+    email_address: Optional[str] = Form(None, description="Email address (required for first-time visitors)"),
+    company: Optional[str] = Form(None, description="Company name (required for first-time visitors)"),
     warehouse: Optional[str] = Form(None, max_length=255, description="Warehouse location"),
     health_declaration: Optional[str] = Form(None, description="Health & safety declaration as JSON string"),
-    image: UploadFile = File(..., description="Visitor image file"),
-    db: Session = Depends(get_db)
+    image: Optional[UploadFile] = File(None, description="Visitor image file (required for first-time visitors)"),
+    is_revisit: Optional[str] = Form(None, description='"true" if reusing details from a previous visit'),
+    db: Session = Depends(get_db),
 ):
     """
-    Check in a new visitor with an image. This is a public endpoint (no authentication required).
+    Check in a visitor — either a brand-new visitor (with a selfie upload) or
+    a returning one (identified by phone via the OTP flow), in which case we
+    reuse the selfie/email/company from the most recent prior visit.
 
-    The endpoint accepts multipart form data with visitor information and an image file.
-    The image is uploaded to S3 and the visitor record is created with the image URL.
-    The visitor number (ID) will be in YYYYMMDDHHMMSS format and used as the image filename.
+    Behavior:
+      - First-time:  `image` is required; goes through S3 upload + WhatsApp approval as before.
+      - Revisit:     `image` may be omitted; we look up the most recent visit by
+                     mobile_number and copy across img_url, email, company so the
+                     new check-in row has the same supporting context as the old one.
 
     Args:
-        visitor_name: Name of the visitor
-        mobile_number: Mobile number of the visitor
-        person_to_meet: Person the visitor wants to meet
-        reason_to_visit: Reason for the visit
-        email_address: Email address of the visitor (optional)
-        company: Company name of the visitor (optional)
-        warehouse: Warehouse location (optional)
-        image: Image file (JPEG, PNG, etc.)
-        db: Database session
-
-    Returns:
-        Created visitor information with check-in details and image URL
+        visitor_name, mobile_number, person_to_meet, reason_to_visit: required.
+        email_address, company: required for first-time visitors. Optional on
+            revisit (looked up from prior visit if omitted).
+        warehouse, health_declaration: optional.
+        image: required for first-time visitors. Optional on revisit (reuses prior
+            visit's S3 URL — no new upload).
+        is_revisit: "true" enables the revisit path. Any other value (or omitted)
+            falls back to first-time validation.
 
     Raises:
-        HTTPException: If image upload fails or validation fails
+        HTTPException: invalid image format/size, or missing fields the chosen
+        path requires (e.g., image missing on first-time check-in).
     """
-    # Validate image file
-    allowed_content_types = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]
-    if image.content_type not in allowed_content_types:
+    is_revisit_flag = (is_revisit or "").strip().lower() == "true"
+
+    # Look up prior visit on revisit to copy missing context across.
+    prior_visit: Optional[Visitor] = None
+    if is_revisit_flag:
+        last10 = _normalize_phone_for_otp(mobile_number)
+        prior_visit = (
+            db.query(Visitor)
+            .filter(Visitor.mobile_number.like(f"%{last10}") if last10 else False)
+            .order_by(Visitor.check_in_time.desc())
+            .first()
+        )
+        if not prior_visit:
+            # OTP succeeded but the row is gone — refuse rather than create a
+            # half-formed record without a selfie.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No previous visit found for this number. Please register as a first-time visitor.",
+            )
+
+    # Image handling depends on path.
+    file_content: Optional[bytes] = None
+    image_content_type: Optional[str] = None
+
+    if image is not None and image.filename:
+        # An image was actually uploaded — validate it the same way regardless of path.
+        allowed_content_types = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]
+        if image.content_type not in allowed_content_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid image format. Allowed formats: {', '.join(allowed_content_types)}",
+            )
+        max_file_size = 10 * 1024 * 1024  # 10 MB
+        file_content = await image.read()
+        if len(file_content) > max_file_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Image file size exceeds 10MB limit",
+            )
+        image_content_type = image.content_type
+    elif not is_revisit_flag:
+        # First-time visitor with no image — that's not allowed.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid image format. Allowed formats: {', '.join(allowed_content_types)}"
+            detail="Selfie image is required for first-time visitors.",
         )
 
-    # Validate file size (max 10MB)
-    max_file_size = 10 * 1024 * 1024  # 10MB
-    file_content = await image.read()
-    if len(file_content) > max_file_size:
+    # Fill in revisit-only defaults from the prior visit.
+    if is_revisit_flag and prior_visit is not None:
+        if not email_address:
+            email_address = prior_visit.email_address
+        if not company:
+            company = prior_visit.company
+        if not warehouse:
+            warehouse = prior_visit.warehouse
+
+    if not email_address:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Image file size exceeds 10MB limit"
+            detail="email_address is required.",
+        )
+    if not company:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="company is required.",
         )
 
-    # Create new visitor first to get the auto-generated ID
+    # Create new visitor first to get the auto-generated ID. On revisit we set
+    # img_url right away from the prior visit so the visitor pass shows the
+    # selfie immediately even though the rest is still WAITING.
     new_visitor = Visitor(
         visitor_name=visitor_name,
         mobile_number=mobile_number,
@@ -355,7 +420,8 @@ async def check_in_visitor_with_image(
         reason_to_visit=reason_to_visit,
         warehouse=warehouse,
         health_declaration=health_declaration,
-        status=VisitorStatus.WAITING
+        img_url=prior_visit.img_url if is_revisit_flag and prior_visit else None,
+        status=VisitorStatus.WAITING,
     )
 
     db.add(new_visitor)
@@ -381,82 +447,109 @@ async def check_in_visitor_with_image(
     # Enrich for response (img_url will be None initially; updated in background)
     visitor_data = enrich_visitor_with_contact(new_visitor, db)
 
-    def _background_s3_and_whatsapp(
-        _file_content: bytes,
-        _content_type: str,
-        _visitor_id: int,
-        _visitor_number: str,
-        _target_phones: List[str],
-        _approver_name: str,
-    ):
-        """
-        Run S3 upload and WhatsApp notification fully in parallel.
-        - WhatsApp: uploads image bytes directly to WhatsApp Media API → sends template
-        - S3: uploads image bytes → updates DB with img_url
-        Both start at the same time using image bytes already in memory.
-        """
-        def _send_whatsapp():
-            if not _target_phones:
-                logger.warning(f"[BG] No target phones for visitor {_visitor_id}")
-                return
-            for phone in _target_phones:
-                try:
-                    sent = whatsapp_service.send_visitor_approval_request(
-                        to_phone=phone,
-                        visitor_name=visitor_name,
-                        visitor_mobile=mobile_number,
-                        visitor_email=email_address,
-                        visitor_company=company,
-                        reason_for_visit=reason_to_visit,
-                        visitor_id=str(_visitor_id),
-                        warehouse=warehouse,
-                        person_to_meet_name=_approver_name,
-                        image_bytes=_file_content,
-                        image_content_type=_content_type,
-                    )
-                    logger.info(f"[BG] WhatsApp {'sent' if sent else 'failed'} to {phone}")
-                except Exception as e:
-                    logger.error(f"[BG] WhatsApp error to {phone}: {e}")
-
-        def _upload_s3_and_update_db():
-            try:
-                logger.info(f"[BG] Starting S3 upload for visitor {_visitor_number}")
-                img_url = s3_service.upload_visitor_image(_file_content, _visitor_number, _content_type)
-                logger.info(f"[BG] S3 upload done: {img_url}")
-            except Exception as e:
-                logger.error(f"[BG] S3 upload failed: {e}")
-                return
-            try:
-                from app.core.database import SessionLocal
-                db_bg = SessionLocal()
-                try:
-                    v = db_bg.query(Visitor).filter(Visitor.id == _visitor_id).first()
-                    if v:
-                        v.img_url = img_url
-                        db_bg.commit()
-                        logger.info(f"[BG] img_url saved to DB for visitor {_visitor_id}")
-                finally:
-                    db_bg.close()
-            except Exception as e:
-                logger.error(f"[BG] DB update failed: {e}")
-
-        # WhatsApp and S3 run fully in parallel — both use image bytes from memory
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(_send_whatsapp), pool.submit(_upload_s3_and_update_db)]
-            for f in futures:
-                try:
-                    f.result()
-                except Exception as e:
-                    logger.error(f"[BG] Parallel task error: {e}")
-
-    # Launch background thread — API response returns immediately
-    t = threading.Thread(
-        target=_background_s3_and_whatsapp,
-        args=(file_content, image.content_type, visitor_id_int,
-              visitor_number, target_phones, approver_name),
-        daemon=True,
+    # Run S3 upload + WhatsApp send IN PARALLEL but SYNCHRONOUSLY before returning.
+    #
+    # Previously this used `threading.Thread(..., daemon=True)` which works locally
+    # under uvicorn but is unreliable on Lambda: the container freezes once the
+    # response is returned, killing the daemon thread mid-send so the host never
+    # gets the WhatsApp message. Running them in a blocking ThreadPoolExecutor
+    # adds ~3-5s to the response but guarantees both tasks complete before
+    # Lambda freezes.
+    existing_image_url = (
+        prior_visit.img_url if (is_revisit_flag and prior_visit) else None
     )
-    t.start()
+
+    # On revisit we don't get a fresh selfie upload, so file_content is None.
+    # If we just passed the prior visit's S3 URL through to Meta as a link,
+    # Meta would have to fetch it itself — and that URL is a presigned URL
+    # that expires after 7 days (and the bucket isn't necessarily public),
+    # so anything older than a week silently fails to deliver.
+    #
+    # Instead, fetch the bytes directly from S3 using our IAM credentials
+    # (same access the rest of the app already needs). That always works as
+    # long as the object still exists in S3, regardless of URL age. Then we
+    # feed the bytes through the same Media API upload path that first-time
+    # check-ins use.
+    if is_revisit_flag and file_content is None and existing_image_url:
+        result = s3_service.download_visitor_image(existing_image_url)
+        if result is not None:
+            file_content, image_content_type = result
+            logger.info(
+                f"[CHECK-IN] Loaded prior selfie via S3 for revisit "
+                f"({len(file_content)} bytes, {image_content_type})"
+            )
+        else:
+            logger.warning(
+                f"[CHECK-IN] Could not load prior selfie via S3 for revisit; "
+                f"WhatsApp will fall back to the stored URL or default image."
+            )
+
+    def _send_whatsapp():
+        if not target_phones:
+            logger.warning(f"[CHECK-IN] No target phones for visitor {visitor_id_int}")
+            return
+        for phone in target_phones:
+            try:
+                sent = whatsapp_service.send_visitor_approval_request(
+                    to_phone=phone,
+                    visitor_name=visitor_name,
+                    visitor_mobile=mobile_number,
+                    visitor_email=email_address,
+                    visitor_company=company,
+                    reason_for_visit=reason_to_visit,
+                    visitor_id=str(visitor_id_int),
+                    warehouse=warehouse,
+                    person_to_meet_name=approver_name,
+                    image_bytes=file_content,
+                    image_content_type=image_content_type or "image/jpeg",
+                    visitor_image_url=existing_image_url,
+                )
+                logger.info(f"[CHECK-IN] WhatsApp {'sent' if sent else 'failed'} to {phone}")
+            except Exception as e:
+                logger.error(f"[CHECK-IN] WhatsApp error to {phone}: {e}", exc_info=True)
+
+    def _upload_s3_and_update_db():
+        # On revisit we may have downloaded the prior selfie just to feed it to
+        # WhatsApp Media — but the new visitor row already has its img_url set
+        # from prior_visit, so don't re-upload to S3.
+        if (not file_content) or is_revisit_flag:
+            logger.info(
+                f"[CHECK-IN] Skipping S3 upload for visitor {visitor_id_int} — "
+                f"{'revisit reuses existing image URL' if is_revisit_flag else 'no image to upload'}."
+            )
+            return
+        try:
+            logger.info(f"[CHECK-IN] Starting S3 upload for visitor {visitor_number}")
+            img_url = s3_service.upload_visitor_image(file_content, visitor_number, image_content_type)
+            logger.info(f"[CHECK-IN] S3 upload done: {img_url}")
+        except Exception as e:
+            logger.error(f"[CHECK-IN] S3 upload failed: {e}", exc_info=True)
+            return
+        try:
+            from app.core.database import SessionLocal
+            db_bg = SessionLocal()
+            try:
+                v = db_bg.query(Visitor).filter(Visitor.id == visitor_id_int).first()
+                if v:
+                    v.img_url = img_url
+                    db_bg.commit()
+                    # Reflect the new URL on the response object too.
+                    visitor_data["img_url"] = img_url
+                    logger.info(f"[CHECK-IN] img_url saved to DB for visitor {visitor_id_int}")
+            finally:
+                db_bg.close()
+        except Exception as e:
+            logger.error(f"[CHECK-IN] DB update failed: {e}", exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_send_whatsapp), pool.submit(_upload_s3_and_update_db)]
+        for f in futures:
+            try:
+                # Hard cap each task at 25s so a hung Meta/S3 call can't push
+                # the handler past API Gateway's 29s timeout.
+                f.result(timeout=25)
+            except Exception as e:
+                logger.error(f"[CHECK-IN] Parallel task error: {e}", exc_info=True)
 
     return VisitorCheckInResponse(
         message="Visitor checked in successfully with image",
@@ -492,14 +585,41 @@ def get_all_visitors(
     offset = (page - 1) * page_size
     visitors = query.order_by(Visitor.check_in_time.desc()).offset(offset).limit(page_size).all()
 
-    # Enrich with contact information
-    enriched_visitors = [enrich_visitor_with_contact(visitor, db) for visitor in visitors]
+    # Enrich with contact information, then validate each row individually so that
+    # a single malformed legacy record cannot 500 the whole page.
+    response_visitors = []
+    skipped = 0
+    with_image = 0
+    without_image = 0
+    for visitor in visitors:
+        try:
+            visitor_data = enrich_visitor_with_contact(visitor, db)
+            response_visitors.append(VisitorResponse.model_validate(visitor_data))
+            if visitor_data.get("img_url"):
+                with_image += 1
+            else:
+                without_image += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning(
+                f"[visitors/list] Skipping visitor id={getattr(visitor, 'id', '?')} "
+                f"due to validation error: {e}"
+            )
+
+    if skipped:
+        logger.warning(f"[visitors/list] Skipped {skipped} unvalidatable row(s) on page {page}")
+
+    # Aggregate summary so the console isn't drowning in per-row [IMG] lines.
+    logger.info(
+        f"[visitors/list] page={page} returned={len(response_visitors)} "
+        f"with_image={with_image} without_image={without_image}"
+    )
 
     return VisitorListResponse(
         total=total,
-        visitors=[VisitorResponse.model_validate(visitor_data) for visitor_data in enriched_visitors],
+        visitors=response_visitors,
         page=page,
-        page_size=page_size
+        page_size=page_size,
     )
 
 
@@ -531,6 +651,298 @@ def get_visitor_stats(
     )
 
 
+# ---------------------------------------------------------------------------
+# Revisit OTP (visitor_revisit_otp template)
+# ---------------------------------------------------------------------------
+# Flow: a returning visitor enters their phone on the register page; we look
+# up the most recent visit, generate a 6-digit code, store it in vis_otp_codes
+# with a 5-minute TTL, and send it via the visitor_revisit_otp WhatsApp
+# template. They then enter the code, we verify, and the frontend routes to
+# /revisit?phone=... where prior details are pre-filled.
+# ---------------------------------------------------------------------------
+
+OTP_TTL_MINUTES = 5
+OTP_MAX_ATTEMPTS = 5
+
+
+def _normalize_phone_for_otp(phone: str) -> str:
+    """Strip non-digits and take the last 10 digits to match how visitors are stored."""
+    digits = ''.join(ch for ch in (phone or '') if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+class SendOtpRequest(BaseModel):
+    phone: str = Field(..., min_length=10, max_length=20)
+
+
+class SendOtpResponse(BaseModel):
+    sent: bool
+    message: str
+    expires_in_seconds: int = OTP_TTL_MINUTES * 60
+
+
+class VerifyOtpRequest(BaseModel):
+    phone: str = Field(..., min_length=10, max_length=20)
+    otp: str = Field(..., min_length=4, max_length=10)
+
+
+class VerifyOtpResponse(BaseModel):
+    verified: bool
+    message: str
+
+
+@router.post("/send-revisit-otp", response_model=SendOtpResponse, status_code=status.HTTP_200_OK)
+def send_revisit_otp(payload: SendOtpRequest, db: Session = Depends(get_db)):
+    """
+    Generate and send a one-time code for the 'Visited us before?' quick check-in.
+
+    Returns 404 if the phone has no prior visit. Overwrites any existing OTP for
+    the same phone so the latest code is always authoritative.
+    """
+    import secrets
+    from datetime import timedelta
+
+    phone = _normalize_phone_for_otp(payload.phone)
+    if len(phone) < 10:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please provide a valid 10-digit mobile number.",
+        )
+
+    # Visitor must have a prior visit on record; otherwise this isn't a "revisit".
+    prior_visit = (
+        db.query(Visitor)
+        .filter(Visitor.mobile_number.like(f"%{phone}"))
+        .order_by(Visitor.check_in_time.desc())
+        .first()
+    )
+    if not prior_visit:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No previous visit found for this number. Please register as a first-time visitor.",
+        )
+
+    # Generate 6-digit code (000000 - 999999), zero-padded.
+    # Use timezone-aware UTC so comparisons against the DB column
+    # (DateTime(timezone=True)) don't raise TypeError later.
+    otp_code = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_TTL_MINUTES)
+
+    existing = db.query(OtpCode).filter(OtpCode.phone == phone).first()
+    if existing:
+        existing.otp = otp_code
+        existing.expires_at = expires_at
+        existing.attempts = 0
+    else:
+        db.add(OtpCode(phone=phone, otp=otp_code, expires_at=expires_at, attempts=0))
+
+    db.commit()
+
+    # Best-effort cleanup of stale rows so the table doesn't grow forever.
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        db.query(OtpCode).filter(OtpCode.expires_at < cutoff).delete()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"[OTP] Cleanup of expired codes failed: {e}")
+
+    # Send the WhatsApp message — use the visitor's actual stored number (with
+    # country code etc.) rather than the trimmed key, in case the template
+    # service formats it differently.
+    to_phone = prior_visit.mobile_number or phone
+    if not whatsapp_service.enabled:
+        # Returning 503 so the frontend's "if (!res.ok)" branch shows the user
+        # a clear error instead of silently advancing them to the OTP screen.
+        logger.warning(
+            f"[OTP] WhatsApp service is disabled — refusing to send OTP to {to_phone}. "
+            f"Check WHATSAPP_ENABLED / WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID env vars."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "OTP service is currently unavailable. Please register as a "
+                "first-time visitor below, or try again later."
+            ),
+        )
+
+    try:
+        ok = whatsapp_service.send_otp_notification(to_phone=to_phone, otp_code=otp_code)
+    except Exception as e:
+        logger.error(f"[OTP] send_otp_notification raised: {e}", exc_info=True)
+        ok = False
+
+    if not ok:
+        # Don't leak the code on failure; the visitor can request another.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not send OTP via WhatsApp. Please try again or register as a first-time visitor.",
+        )
+
+    return SendOtpResponse(
+        sent=True,
+        message=f"OTP sent on WhatsApp to {to_phone[-4:].rjust(len(to_phone), '*')}.",
+    )
+
+
+@router.post("/verify-revisit-otp", response_model=VerifyOtpResponse, status_code=status.HTTP_200_OK)
+def verify_revisit_otp(payload: VerifyOtpRequest, db: Session = Depends(get_db)):
+    """
+    Validate a previously-issued revisit OTP.
+
+    On success the row is deleted so the code can't be reused; on the
+    OTP_MAX_ATTEMPTS-th wrong guess the row is also deleted to force a fresh
+    send (limits brute force).
+    """
+    phone = _normalize_phone_for_otp(payload.phone)
+    if len(phone) < 10:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please provide a valid 10-digit mobile number.",
+        )
+
+    row = db.query(OtpCode).filter(OtpCode.phone == phone).first()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No OTP requested for this number. Please request a new code.",
+        )
+
+    # Normalise both sides to UTC-aware. Postgres returns timezone-aware datetimes
+    # (DateTime(timezone=True) column), so comparing against datetime.utcnow()
+    # (naive) raises TypeError and bubbles up as a 500.
+    row_expiry = row.expires_at
+    if row_expiry.tzinfo is None:
+        row_expiry = row_expiry.replace(tzinfo=timezone.utc)
+    if row_expiry < datetime.now(timezone.utc):
+        db.delete(row)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This OTP has expired. Please request a new code.",
+        )
+
+    submitted = (payload.otp or "").strip()
+    if submitted != row.otp:
+        row.attempts = (row.attempts or 0) + 1
+        if row.attempts >= OTP_MAX_ATTEMPTS:
+            db.delete(row)
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many incorrect attempts. Please request a new code.",
+            )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Incorrect OTP. {OTP_MAX_ATTEMPTS - row.attempts} attempt(s) remaining.",
+        )
+
+    # Success — consume the code so it can't be reused.
+    db.delete(row)
+    db.commit()
+    return VerifyOtpResponse(verified=True, message="Verification successful.")
+
+
+@router.get("/export", status_code=status.HTTP_200_OK)
+def export_visitors_excel(
+    from_date: date = Query(..., description="Start date (YYYY-MM-DD)"),
+    to_date: date = Query(..., description="End date (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_user: Approver = Depends(get_current_approver),
+):
+    """
+    Export visitor data as Excel file for a given date range.
+    Requires superuser authentication.
+    Excludes img_url, created_at, and updated_at columns.
+    """
+    if not current_user.superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers can export visitor data"
+        )
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    start_dt = datetime.combine(from_date, datetime.min.time())
+    end_dt = datetime.combine(to_date, datetime.max.time())
+
+    visitors = (
+        db.query(Visitor)
+        .filter(Visitor.check_in_time >= start_dt, Visitor.check_in_time <= end_dt)
+        .order_by(Visitor.check_in_time.desc())
+        .all()
+    )
+
+    columns = [
+        ("ID", "id"),
+        ("Visitor Name", "visitor_name"),
+        ("Mobile Number", "mobile_number"),
+        ("Email Address", "email_address"),
+        ("Company", "company"),
+        ("Person To Meet", "person_to_meet"),
+        ("Reason To Visit", "reason_to_visit"),
+        ("Warehouse", "warehouse"),
+        ("Health Declaration", "health_declaration"),
+        ("Carrying Electronics", "carrying_electronics"),
+        ("Electronics Items", "electronics_items"),
+        ("Status", "status"),
+        ("Rejection Reason", "rejection_reason"),
+        ("Check In Time", "check_in_time"),
+        ("Check Out Time", "check_out_time"),
+    ]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Visitors"
+
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    for col_idx, (header, _) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    for row_idx, visitor in enumerate(visitors, 2):
+        for col_idx, (_, attr) in enumerate(columns, 1):
+            value = getattr(visitor, attr, None)
+            if isinstance(value, datetime):
+                value = value.strftime("%Y-%m-%d %H:%M:%S")
+            elif hasattr(value, "value"):
+                value = value.value
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = thin_border
+
+    for col_idx, (header, _) in enumerate(columns, 1):
+        max_len = len(header)
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 40)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"visitors_{from_date}_{to_date}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/phone/{phone_number}", response_model=List[VisitorResponse], status_code=status.HTTP_200_OK)
 def get_visitor_by_phone(
     phone_number: str,
@@ -558,10 +970,14 @@ def get_visitor_by_phone(
             detail=f"No visitors found with phone number {phone_number}"
         )
 
-    # Enrich with contact information
-    enriched_visitors = [enrich_visitor_with_contact(visitor, db) for visitor in visitors]
-
-    return [VisitorResponse.model_validate(visitor_data) for visitor_data in enriched_visitors]
+    # Tolerant per-row validation — skip and log malformed rows.
+    response_visitors = []
+    for visitor in visitors:
+        try:
+            response_visitors.append(VisitorResponse.model_validate(enrich_visitor_with_contact(visitor, db)))
+        except Exception as e:
+            logger.warning(f"[visitors/phone] Skipping visitor id={getattr(visitor, 'id', '?')}: {e}")
+    return response_visitors
 
 
 @router.get("/{visitor_id}", response_model=VisitorResponse, status_code=status.HTTP_200_OK)
@@ -596,6 +1012,12 @@ def get_visitor_by_id(
 
     # Enrich with contact information
     visitor_data = enrich_visitor_with_contact(visitor, db)
+
+    img = visitor_data.get("img_url")
+    logger.info(
+        f"[visitors/{{id}}] id={visitor_id} img_url={'set' if img else 'NULL'}"
+        + (f" (stored={'yes' if visitor.img_url else 'no'})" if not img else "")
+    )
 
     return VisitorResponse.model_validate(visitor_data)
 
@@ -880,67 +1302,71 @@ def update_visitor_status(
         
         logger.info(f"[Appointment] Appointment rejection processed for visitor {visitor_id}")
 
-    # Send WhatsApp to visitor when approved (for both regular visitors and appointments)
-    if status_data.status == VisitorStatus.APPROVED:
-        logger.info(f"[WA] Visitor {visitor_id} approved, sending WhatsApp notification to visitor")
-
-        def send_approval_wa_background(visitor_mobile: str, visitor_name: str,
-                                        person_to_meet_name: Optional[str],
-                                        visitor_id_str: str, is_appt: bool,
-                                        visit_date: Optional[str], visit_time: Optional[str]):
-            """Background task to send approval WhatsApp to visitor using visitor_approved template."""
-            try:
-                logger.info(f"[WA] Sending approval WhatsApp to visitor {visitor_name} at {visitor_mobile}")
-
-                wa_sent = whatsapp_service.send_approval_notification(
-                    to_phone=visitor_mobile,
-                    visitor_id_str=visitor_id_str,
-                )
-
-                if wa_sent:
-                    logger.info(f"[WA] Approval WhatsApp sent to visitor {visitor_name} at {visitor_mobile}")
-                else:
-                    logger.warning(f"[WA] Failed to send approval WhatsApp to visitor {visitor_name} at {visitor_mobile}")
-            except Exception as e:
-                logger.error(f"[WA] Error sending approval WhatsApp to visitor: {e}", exc_info=True)
-        
-        # Get person to meet name
-        person_to_meet_name = None
-        try:
-            approver = db.query(Approver).filter(
-                (Approver.username == visitor.person_to_meet) | 
-                (Approver.name == visitor.person_to_meet)
-            ).first()
-            if approver:
-                person_to_meet_name = approver.name
-        except:
-            person_to_meet_name = visitor.person_to_meet
-        
-        # Generate visitor number from check_in_time (format: YYYYMMDDHHMMSS)
+    # Notify visitor of approve/reject decision via WhatsApp.
+    # Sent synchronously (not via BackgroundTasks): on Lambda, background tasks can be
+    # killed when the runtime freezes the container after returning the response, and
+    # any silent failure becomes invisible. Synchronous + explicit logging lets us see
+    # exactly which step failed.
+    if status_data.status in (VisitorStatus.APPROVED, VisitorStatus.REJECTED):
+        is_approval = status_data.status == VisitorStatus.APPROVED
+        label = "approval" if is_approval else "rejection"
         visitor_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S")
-        
-        # Add background task to send approval WhatsApp
-        background_tasks.add_task(
-            send_approval_wa_background,
-            visitor.mobile_number,
-            visitor.visitor_name,
-            person_to_meet_name,
-            visitor_number,
-            is_appointment,
-            date_of_visit,
-            time_slot
-        )
 
-    # Send visitor_rejected template when rejected
-    if status_data.status == VisitorStatus.REJECTED:
-        visitor_number = visitor.check_in_time.strftime("%Y%m%d%H%M%S")
-        try:
-            whatsapp_service.send_rejection_notification(
-                to_phone=visitor.mobile_number,
-                visitor_id_str=visitor_number,
+        if not whatsapp_service.enabled:
+            logger.warning(
+                f"[WA] Service disabled — skipping {label} notification for visitor {visitor_id}. "
+                f"Check WHATSAPP_ENABLED / WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID."
             )
-        except Exception as e:
-            logger.error(f"[WA] Error sending rejection WhatsApp: {e}")
+        elif not visitor.mobile_number:
+            logger.warning(
+                f"[WA] Visitor {visitor_id} ({visitor.visitor_name}) has no mobile_number — "
+                f"skipping {label} notification."
+            )
+        else:
+            logger.info(
+                f"[WA] Sending {label} WhatsApp to {visitor.visitor_name} at "
+                f"{visitor.mobile_number} (cn={visitor_number})"
+            )
+            try:
+                if is_appointment:
+                    if is_approval:
+                        # qr_code is set above when an appointment is approved (CONFIRMED branch)
+                        wa_sent = whatsapp_service.send_appointment_approved_notification(
+                            to_phone=visitor.mobile_number,
+                            visitor_name=visitor.visitor_name,
+                            date_of_visit=date_of_visit,
+                            time_slot=time_slot,
+                            qr_code=qr_code if 'qr_code' in locals() else visitor_number,
+                            visitor_id_str=visitor_number,
+                        )
+                    else:
+                        wa_sent = whatsapp_service.send_appointment_rejected_notification(
+                            to_phone=visitor.mobile_number,
+                            visitor_name=visitor.visitor_name,
+                            date_of_visit=date_of_visit,
+                            time_slot=time_slot,
+                            rejection_reason=(getattr(status_data, 'rejection_reason', None) or visitor.rejection_reason),
+                            visitor_id_str=visitor_number,
+                        )
+                elif is_approval:
+                    wa_sent = whatsapp_service.send_approval_notification(
+                        to_phone=visitor.mobile_number,
+                        visitor_id_str=visitor_number,
+                    )
+                else:
+                    wa_sent = whatsapp_service.send_rejection_notification(
+                        to_phone=visitor.mobile_number,
+                        visitor_id_str=visitor_number,
+                    )
+                if wa_sent:
+                    logger.info(f"[WA] {label.capitalize()} sent OK to {visitor.mobile_number}")
+                else:
+                    logger.warning(
+                        f"[WA] {label.capitalize()} send returned False for {visitor.mobile_number} — "
+                        f"check Meta API error above."
+                    )
+            except Exception as e:
+                logger.error(f"[WA] Error sending {label} WhatsApp: {e}", exc_info=True)
 
     db.commit()
     db.refresh(visitor)
@@ -1327,16 +1753,16 @@ def google_form_submission(
                     if target_phones:
                         for to_phone in target_phones:
                             logger.info(f"[WA] Attempting to send WhatsApp to {to_phone}")
-                            wa_sent = whatsapp_service.send_visitor_approval_request(
+                            # Google-form submissions are always appointments -> send the
+                            # appointment-specific approval template carrying date/time.
+                            wa_sent = whatsapp_service.send_appointment_approval_request(
                                 to_phone=to_phone,
                                 visitor_name=visitor_name,
-                                visitor_mobile=mobile,
-                                visitor_email=email,
-                                visitor_company=company,
-                                reason_for_visit=reason,
+                                company=company,
+                                purpose=reason.replace("[APPOINTMENT] ", ""),
+                                date_of_visit=date_of_visit,
+                                time_slot=time_slot,
                                 visitor_id=str(visitor_id),
-                                warehouse=warehouse,
-                                person_to_meet_name=approver.name,
                             )
                             if wa_sent:
                                 logger.info(f"[WA] WhatsApp notification sent successfully to {to_phone} for visitor {visitor_id}")
@@ -1406,7 +1832,11 @@ def get_today_active_visitors(
         Visitor.status.in_([VisitorStatus.WAITING, VisitorStatus.APPROVED])
     ).order_by(Visitor.check_in_time.desc()).all()
 
-    # Enrich with contact information
-    enriched_visitors = [enrich_visitor_with_contact(visitor, db) for visitor in visitors]
-
-    return [VisitorResponse.model_validate(visitor_data) for visitor_data in enriched_visitors]
+    # Tolerant per-row validation — skip and log malformed rows.
+    response_visitors = []
+    for visitor in visitors:
+        try:
+            response_visitors.append(VisitorResponse.model_validate(enrich_visitor_with_contact(visitor, db)))
+        except Exception as e:
+            logger.warning(f"[visitors/today] Skipping visitor id={getattr(visitor, 'id', '?')}: {e}")
+    return response_visitors
